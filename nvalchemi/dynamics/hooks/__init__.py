@@ -56,7 +56,11 @@ from nvalchemi.dynamics.hooks.logging import LoggingHook
 from nvalchemi.dynamics.hooks.monitors import EnergyDriftMonitorHook
 from nvalchemi.dynamics.hooks.safety import MaxForceClampHook, NaNDetectorHook
 from nvalchemi.dynamics.hooks.snapshot import ConvergedSnapshotHook, SnapshotHook
-from nvalchemi.dynamics.hooks.symmetry import FixSymmetryHook
+from nvalchemi.dynamics.hooks.symmetry import (
+    FixSymmetryHook,
+    SymmetryRecord,
+    prepare_symmetry,
+)
 from nvalchemi.hooks.physicsnemo_profiling import TorchProfilerHook
 from nvalchemi.hooks.stage_timing import StageTimingHook
 
@@ -72,6 +76,8 @@ __all__ = [
     "SnapshotHook",
     "StageTimingHook",
     "TorchProfilerHook",
+    "SymmetryRecord",
+    "prepare_symmetry",
 ]
 
 _REMOVED_PROFILER_HOOKS = {"ProfilerHook"}

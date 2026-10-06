@@ -67,7 +67,7 @@ from ase.spacegroup.symmetrize import check_symmetry
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics import ConvergenceHook, DynamicsStage, FIRE2VariableCell
-from nvalchemi.dynamics.hooks import FixSymmetryHook
+from nvalchemi.dynamics.hooks import FixSymmetryHook, prepare_symmetry
 
 if TYPE_CHECKING:
     from nvalchemi.models.base import BaseModelMixin
@@ -292,8 +292,8 @@ def make_optimizer(
     Parameters
     ----------
     batch : Batch
-        The exact graph layout that will be optimized.  ``FixSymmetryHook``
-        refines it in-place while discovering symmetry operations.
+        The graph layout that will be optimized. Each graph is prepared with
+        ASE/spglib before the runtime hook is constructed.
     model : BaseModelMixin
         TensorNet model wrapper.
     convergence_hook : ConvergenceHook | None, optional
@@ -305,7 +305,27 @@ def make_optimizer(
         Configured optimizer with neighbor-list and symmetry hooks.
     """
 
-    symmetry_hook = FixSymmetryHook(batch, symprec=SYMPREC)
+    refined_data = []
+    symmetry_records = []
+    for symmetry_id, data in enumerate(batch.to_data_list()):
+        refined, record = prepare_symmetry(
+            data,
+            symmetry_id=symmetry_id,
+            symprec=SYMPREC,
+        )
+        refined_data.append(refined)
+        symmetry_records.append(record)
+    refined_batch = Batch.from_data_list(refined_data, device=batch.device)
+    with torch.no_grad():
+        batch.positions.copy_(refined_batch.positions)
+        batch.cell.copy_(refined_batch.cell)
+    batch.add_key(
+        "symmetry_id",
+        [data.symmetry_id for data in refined_data],
+        level="system",
+    )
+
+    symmetry_hook = FixSymmetryHook(records=symmetry_records)
     optimizer = FIRE2VariableCell(
         model=model,
         dt=0.02,

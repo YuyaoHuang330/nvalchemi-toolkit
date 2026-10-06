@@ -19,7 +19,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import numpy as np
 import pytest
 import torch
 
@@ -34,9 +33,11 @@ from nvalchemi.dynamics import (
     FIRE2VariableCell,
     FIREVariableCell,
     FusedStage,
+    HostMemory,
+    SizeAwareSampler,
 )
 from nvalchemi.dynamics.base import DynamicsStage
-from nvalchemi.dynamics.hooks import FixSymmetryHook
+from nvalchemi.dynamics.hooks import FixSymmetryHook, SymmetryRecord, prepare_symmetry
 from nvalchemi.hooks import DynamicsContext, Hook
 from nvalchemi.models.base import BaseModelMixin, ModelConfig
 
@@ -93,6 +94,30 @@ def _context(batch: Batch, state: object | None = None) -> DynamicsContext:
     """Create a hook context with an optional optimizer state."""
     workflow = SimpleNamespace(_state=state) if state is not None else None
     return DynamicsContext(batch=batch, workflow=workflow)
+
+
+def _make_hook(batch: Batch, **kwargs: object) -> FixSymmetryHook:
+    """Prepare every graph, update *batch*, and construct the runtime hook."""
+    refined_data = []
+    records = []
+    for symmetry_id, data in enumerate(batch.to_data_list()):
+        refined, record = prepare_symmetry(data, symmetry_id)
+        refined_data.append(refined)
+        records.append(record)
+    refined_batch = Batch.from_data_list(refined_data).to(batch.device)
+    with torch.no_grad():
+        batch.positions.copy_(refined_batch.positions)
+        batch.cell.copy_(refined_batch.cell)
+    batch.add_key(
+        "symmetry_id",
+        [data.symmetry_id for data in refined_data],
+        level="system",
+        overwrite=hasattr(batch, "symmetry_id"),
+    )
+    hook = FixSymmetryHook(records=records, **kwargs)
+    hook._bind_batch(batch)
+    hook._layout_signature = hook._current_layout_signature(batch)
+    return hook
 
 
 class _AsymmetricModel(torch.nn.Module, BaseModelMixin):
@@ -200,10 +225,11 @@ def _set_controlled_symmetry(hook: FixSymmetryHook, batch: Batch) -> None:
 class TestFixSymmetryHook:
     """Behavior tests for :class:`FixSymmetryHook`."""
 
-    def test_constructor_refines_and_records_each_graph(self, device: str) -> None:
-        """Each graph gets independent ASE symmetry metadata on its device."""
+    def test_prepare_and_bind_records_each_graph(self, device: str) -> None:
+        """Prepared records bind independently in active graph order."""
         batch = _make_batch(device)
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
+        hook(_context(batch), DynamicsStage.BEFORE_PRE_UPDATE)
 
         assert len(hook.rotations) == 2
         assert len(hook.translations) == 2
@@ -213,36 +239,26 @@ class TestFixSymmetryHook:
         assert hook.symm_maps[1].shape[1] == 2
         assert all(rotation.device.type == device for rotation in hook.rotations)
 
-    def test_constructor_refinement_is_atomic(self) -> None:
-        """A later graph failure leaves all input positions and cells unchanged."""
+    def test_prepare_failure_does_not_mutate_input(self) -> None:
+        """A preparation failure leaves the input structure unchanged."""
         batch = _make_batch()
         positions = batch.positions.clone()
         cells = batch.cell.clone()
-        calls = 0
 
         def fake_refine(atoms, symprec, verbose):
             del symprec, verbose
             atoms.positions += 1.0
 
         def fake_prep(atoms, symprec, verbose):
-            nonlocal calls
-            del symprec, verbose
-            calls += 1
-            if calls == 2:
-                raise RuntimeError("second graph failed")
-            count = len(atoms)
-            return (
-                np.eye(3, dtype=int)[None],
-                np.zeros((1, 3)),
-                np.arange(count)[None],
-            )
+            del atoms, symprec, verbose
+            raise RuntimeError("preparation failed")
 
         with (
             patch("ase.spacegroup.symmetrize.refine_symmetry", fake_refine),
             patch("ase.spacegroup.symmetrize.prep_symmetry", fake_prep),
-            pytest.raises(RuntimeError, match="second graph failed"),
+            pytest.raises(RuntimeError, match="preparation failed"),
         ):
-            FixSymmetryHook(batch)
+            prepare_symmetry(batch.get_data(1), 1)
 
         assert torch.equal(batch.positions, positions)
         assert torch.equal(batch.cell, cells)
@@ -250,7 +266,7 @@ class TestFixSymmetryHook:
     def test_rank1_position_force_and_velocity_projection(self, device: str) -> None:
         """Position steps, forces, and velocities use the ASE rank-1 formula."""
         batch = _make_batch(device)
-        hook = FixSymmetryHook(batch, adjust_cell=False)
+        hook = _make_hook(batch, adjust_cell=False)
         _set_controlled_symmetry(hook, batch)
         ctx = _context(batch)
         hook(ctx, DynamicsStage.BEFORE_PRE_UPDATE)
@@ -284,7 +300,7 @@ class TestFixSymmetryHook:
     def test_rank2_stress_and_cell_projection(self, device: str) -> None:
         """Stress and deformation-gradient steps use the ASE rank-2 formula."""
         batch = _make_batch(device)
-        hook = FixSymmetryHook(batch, adjust_positions=False)
+        hook = _make_hook(batch, adjust_positions=False)
         _set_controlled_symmetry(hook, batch)
         ctx = _context(batch)
         hook(ctx, DynamicsStage.BEFORE_PRE_UPDATE)
@@ -334,7 +350,7 @@ class TestFixSymmetryHook:
         from ase.spacegroup.symmetrize import symmetrize_rank1, symmetrize_rank2
 
         batch = _make_batch()
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         _set_controlled_symmetry(hook, batch)
         graph_index = 1
         vectors = torch.tensor(
@@ -387,7 +403,7 @@ class TestFixSymmetryHook:
         from ase.spacegroup.symmetrize import symmetrize_rank1, symmetrize_rank2
 
         batch = _make_space_group_batch(structure, device, dtype)
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         atom_count = batch.positions.shape[0]
         vectors = (
             torch.arange(
@@ -445,7 +461,7 @@ class TestFixSymmetryHook:
     ) -> None:
         """Equal rotations with distinct atom maps remain distinct operations."""
         batch = _make_batch(device, dtype)
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         graph_index = 1
         identity = torch.eye(3, dtype=dtype, device=device)
         rotations = torch.stack([identity, identity, identity])
@@ -478,7 +494,7 @@ class TestFixSymmetryHook:
     ) -> None:
         """Mixed atom and operation counts use one batched inverse."""
         batch = _make_batch(device, dtype)
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         assert hook.rotations[0].shape[0] != hook.rotations[1].shape[0]
         vectors = torch.tensor(
             [[1.0, 0.2, 0.7], [0.4, -0.5, 0.6], [-0.3, 0.8, 1.4]],
@@ -520,7 +536,7 @@ class TestFixSymmetryHook:
     def test_packed_rank1_accumulates_non_bijective_maps(self) -> None:
         """Repeated destinations retain every source contribution."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         _set_controlled_symmetry(hook, batch)
         hook.symm_maps[1] = torch.tensor([[0, 0], [1, 1]])
         vectors = torch.tensor(
@@ -549,7 +565,7 @@ class TestFixSymmetryHook:
     def test_packed_rank1_chunk_boundaries_do_not_change_projection(self) -> None:
         """One-pair chunks match an unchunked packed projection."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         _set_controlled_symmetry(hook, batch)
         vectors = torch.tensor(
             [[1.0, 0.2, 0.7], [0.4, -0.5, 0.6], [-0.3, 0.8, 1.4]],
@@ -566,7 +582,7 @@ class TestFixSymmetryHook:
     def test_packed_rank1_cache_tracks_rotation_and_map_sources(self) -> None:
         """Packed metadata invalidates on mutation and replacement."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         _set_controlled_symmetry(hook, batch)
         first = hook._rank1_batch_metadata(batch.positions)
 
@@ -589,7 +605,7 @@ class TestFixSymmetryHook:
     def test_position_lifecycle_keeps_graph_rank1_projector(self) -> None:
         """Only position steps stay graph-local; force and velocity are packed."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch, adjust_cell=False)
+        hook = _make_hook(batch, adjust_cell=False)
         ctx = _context(batch)
 
         with (
@@ -624,7 +640,7 @@ class TestFixSymmetryHook:
     ) -> None:
         """Rank-2 compression preserves multiplicities and invalidates caches."""
         batch = _make_batch(device, dtype)
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         graph_index = 1
         identity = torch.eye(3, dtype=dtype, device=device)
         c2z = torch.diag(torch.tensor([-1.0, -1.0, 1.0], dtype=dtype, device=device))
@@ -662,7 +678,7 @@ class TestFixSymmetryHook:
     ) -> None:
         """A mixed batch matches graph oracles with one batched inverse."""
         batch = _make_batch(device, dtype)
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         assert hook.rotations[0].shape[0] != hook.rotations[1].shape[0]
         tensors = torch.tensor(
             [
@@ -701,7 +717,7 @@ class TestFixSymmetryHook:
     ) -> None:
         """Padded rotation cache preserves weights and invalidates safely."""
         batch = _make_batch(device, dtype)
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         identity = torch.eye(3, dtype=dtype, device=device)
         c2z = torch.diag(torch.tensor([-1.0, -1.0, 1.0], dtype=dtype, device=device))
         hook.rotations = [
@@ -764,7 +780,7 @@ class TestFixSymmetryHook:
     ) -> None:
         """Single-operation chunks match an unchunked rank-1 projection."""
         batch = _make_batch(device, dtype)
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         graph_index = 1
         identity = torch.eye(3, dtype=dtype, device=device)
         c2x = torch.diag(torch.tensor([1.0, -1.0, -1.0], dtype=dtype, device=device))
@@ -801,7 +817,7 @@ class TestFixSymmetryHook:
     ) -> None:
         """FIRE and FIRE2 Hdot state is projected through deformation rate."""
         batch = _make_batch(device)
-        hook = FixSymmetryHook(batch, adjust_positions=False)
+        hook = _make_hook(batch, adjust_positions=False)
         _set_controlled_symmetry(hook, batch)
         raw = torch.tensor(
             [
@@ -824,14 +840,14 @@ class TestFixSymmetryHook:
     def test_cell_step_warning_and_error_thresholds(self) -> None:
         """Large deformation steps follow ASE's warning and error thresholds."""
         warning_batch = _make_batch()
-        warning_hook = FixSymmetryHook(warning_batch, adjust_positions=False)
+        warning_hook = _make_hook(warning_batch, adjust_positions=False)
         warning_hook(_context(warning_batch), DynamicsStage.BEFORE_PRE_UPDATE)
         warning_batch.cell[0].mul_(1.2)
         with pytest.warns(UserWarning, match="exceeds 0.15"):
             warning_hook(_context(warning_batch), DynamicsStage.AFTER_PRE_UPDATE)
 
         error_batch = _make_batch()
-        error_hook = FixSymmetryHook(error_batch, adjust_positions=False)
+        error_hook = _make_hook(error_batch, adjust_positions=False)
         error_hook(_context(error_batch), DynamicsStage.BEFORE_PRE_UPDATE)
         error_batch.cell[0].mul_(1.3)
         with pytest.raises(RuntimeError, match="exceeding 0.25"):
@@ -840,7 +856,7 @@ class TestFixSymmetryHook:
     def test_cell_step_threshold_uses_whole_batch_before_mutation(self) -> None:
         """A later graph triggers one batch-wide warning or atomic rejection."""
         warning_batch = _make_batch()
-        warning_hook = FixSymmetryHook(warning_batch, adjust_positions=False)
+        warning_hook = _make_hook(warning_batch, adjust_positions=False)
         warning_hook(_context(warning_batch), DynamicsStage.BEFORE_PRE_UPDATE)
         warning_batch.cell[1].mul_(1.2)
         with pytest.warns(UserWarning, match="exceeds 0.15") as records:
@@ -848,7 +864,7 @@ class TestFixSymmetryHook:
         assert len(records) == 1
 
         error_batch = _make_batch()
-        error_hook = FixSymmetryHook(error_batch, adjust_positions=False)
+        error_hook = _make_hook(error_batch, adjust_positions=False)
         error_hook(_context(error_batch), DynamicsStage.BEFORE_PRE_UPDATE)
         proposed_cells = error_batch.cell.clone()
         proposed_cells[0].mul_(1.1)
@@ -861,7 +877,7 @@ class TestFixSymmetryHook:
     def test_cell_projection_failure_preserves_proposed_batch(self) -> None:
         """A failed batched projection cannot partially update graph cells."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch, adjust_positions=False)
+        hook = _make_hook(batch, adjust_positions=False)
         ctx = _context(batch)
         hook(ctx, DynamicsStage.BEFORE_PRE_UPDATE)
         batch.cell[0].mul_(1.01)
@@ -883,7 +899,7 @@ class TestFixSymmetryHook:
     def test_cell_step_rejects_non_finite_deformation(self) -> None:
         """Unchecked linear algebra still rejects non-finite cell steps."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch, adjust_positions=False)
+        hook = _make_hook(batch, adjust_positions=False)
         hook(_context(batch), DynamicsStage.BEFORE_PRE_UPDATE)
         batch.cell[1, 0, 0] = torch.nan
 
@@ -908,7 +924,7 @@ class TestFixSymmetryHook:
             pbc=torch.ones(1, 3, dtype=torch.bool),
         )
         batch = Batch.from_data_list([data]).to(device)
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         ctx = _context(batch)
         initial_scaled = torch.linalg.solve(
             batch.cell[0].T, batch.positions.T
@@ -928,57 +944,75 @@ class TestFixSymmetryHook:
                 cell=batch.cell[0].cpu().numpy(),
                 pbc=True,
             ),
-            symprec=hook.symprec,
+            symprec=0.01,
             verbose=False,
         )
         assert symmetry.number == 229
 
-    def test_batch_identity_validation(self) -> None:
-        """First-use graph boundaries and atomic ordering fail explicitly."""
+    def test_unknown_id_and_atomic_number_mismatch_fail_on_bind(self) -> None:
+        """Record lookup and atom ordering are validated for every new layout."""
         batch = _make_batch()
-        changed_numbers = _make_batch()
-        numbers_hook = FixSymmetryHook(batch)
-        changed_numbers.atomic_numbers[0] = 8
+        hook = _make_hook(batch)
+        batch.symmetry_id[0] = 99
+        with pytest.raises(ValueError, match="no record for symmetry_id 99"):
+            hook(_context(batch), DynamicsStage.BEFORE_PRE_UPDATE)
+
+        batch.symmetry_id[0] = 0
+        batch.atomic_numbers[0] = 8
         with pytest.raises(ValueError, match="atomic_numbers"):
-            numbers_hook(_context(changed_numbers), DynamicsStage.BEFORE_PRE_UPDATE)
-        assert not numbers_hook._batch_validated
-        numbers_hook(_context(batch), DynamicsStage.BEFORE_PRE_UPDATE)
-        assert numbers_hook._batch_validated
+            hook(_context(batch), DynamicsStage.BEFORE_PRE_UPDATE)
 
-        changed_layout = Batch.from_data_list(
-            [batch.get_data(0), batch.get_data(0), batch.get_data(0)]
-        )
-        layout_hook = FixSymmetryHook(batch)
-        with pytest.raises(ValueError, match="batch graph layout"):
-            layout_hook(_context(changed_layout), DynamicsStage.BEFORE_PRE_UPDATE)
-        assert not layout_hook._batch_validated
-
-    def test_batch_identity_is_validated_once(self) -> None:
-        """Batch identity checks run only on the first successful invocation."""
+    def test_rebinds_reordered_and_shrunk_variable_size_batches(self) -> None:
+        """Graph reordering and shrinking bind records by stable ID."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch, adjust_positions=False, adjust_cell=False)
-        ctx = _context(batch)
-        stages = (
-            DynamicsStage.BEFORE_PRE_UPDATE,
-            DynamicsStage.AFTER_PRE_UPDATE,
-            DynamicsStage.AFTER_COMPUTE,
-            DynamicsStage.AFTER_POST_UPDATE,
+        hook = _make_hook(batch)
+        hook(_context(batch), DynamicsStage.BEFORE_PRE_UPDATE)
+        first_cache = hook._rank1_batch_metadata(batch.positions)
+        first_rank2 = hook._rank2_batch_rotations(batch.cell)[0]
+
+        reordered = Batch.from_data_list([batch.get_data(1), batch.get_data(0)])
+        hook(_context(reordered), DynamicsStage.BEFORE_PRE_UPDATE)
+        assert reordered.symmetry_id.reshape(-1).tolist() == [1, 0]
+        assert hook._batch_ptr_values == (0, 2, 3)
+        assert hook.symm_maps[0].shape[1] == 2
+        assert hook._rank1_batch_cache is None
+        assert hook._rank2_batch_cache is None
+
+        second_cache = hook._rank1_batch_metadata(reordered.positions)
+        second_rank2 = hook._rank2_batch_rotations(reordered.cell)[0]
+        assert second_cache is not first_cache
+        assert second_rank2 is not first_rank2
+
+        shrunk = Batch.from_data_list([reordered.get_data(1)])
+        hook(_context(shrunk), DynamicsStage.BEFORE_PRE_UPDATE)
+        assert hook._batch_ptr_values == (0, 1)
+        assert len(hook.rotations) == 1
+
+    def test_same_atom_count_different_symmetry_uses_id(self) -> None:
+        """Equal-size records are selected by ID, not composition or layout."""
+        batch = _make_batch()
+        _make_hook(batch)
+        data = batch.get_data(0)
+        refined_a, record_a = prepare_symmetry(data, 10)
+        refined_b, record_b = prepare_symmetry(data, 11)
+        identity = torch.eye(3).reshape(1, 3, 3)
+        record_b = SymmetryRecord(
+            symmetry_id=11,
+            atomic_numbers=record_b.atomic_numbers,
+            rotations=identity,
+            translations=torch.zeros(1, 3),
+            symm_map=torch.zeros(1, 1, dtype=torch.long),
         )
-
-        with patch.object(
-            hook, "_validate_batch", wraps=hook._validate_batch
-        ) as validate:
-            for _ in range(2):
-                for stage in stages:
-                    hook(ctx, stage)
-
-        assert validate.call_count == 1
-        assert hook._batch_validated
+        mixed = Batch.from_data_list([refined_a, refined_b])
+        hook = FixSymmetryHook(records=[record_a, record_b])
+        hook(_context(mixed), DynamicsStage.BEFORE_PRE_UPDATE)
+        assert hook.rotations[0].shape[0] == record_a.rotations.shape[0]
+        assert hook.rotations[1].shape[0] == 1
 
     def test_projection_lifecycle_uses_check_free_linalg(self) -> None:
         """Per-step projections avoid error-checking linear algebra calls."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         _set_controlled_symmetry(hook, batch)
         state = SimpleNamespace(cell_velocity=torch.full_like(batch.cell, 0.01))
         ctx = _context(batch, state)
@@ -1026,24 +1060,25 @@ class TestFixSymmetryHook:
             call.kwargs["check_errors"] is False for call in solve_ex.call_args_list
         )
 
-    def test_batch_validation_is_not_latched_when_stage_fails(self) -> None:
-        """A failed first stage leaves identity validation active for retry."""
+    def test_bind_is_not_latched_when_validation_fails(self) -> None:
+        """A failed bind retries validation after the input is corrected."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch)
+        prepared = _make_hook(batch)
+        hook = FixSymmetryHook(records=prepared.records)
 
-        with pytest.raises(RuntimeError, match="did not snapshot cells"):
+        with pytest.raises(RuntimeError, match="BEFORE_PRE_UPDATE"):
             hook(_context(batch), DynamicsStage.AFTER_PRE_UPDATE)
-        assert not hook._batch_validated
+        assert hook._layout_signature is None
 
         batch.atomic_numbers[0] = 8
         with pytest.raises(ValueError, match="atomic_numbers"):
             hook(_context(batch), DynamicsStage.BEFORE_PRE_UPDATE)
-        assert not hook._batch_validated
+        assert hook._layout_signature is None
 
     def test_protocol_stages_and_frequency_validation(self) -> None:
         """The public hook implements the multi-stage hook protocol."""
         batch = _make_batch()
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         assert isinstance(hook, Hook)
         assert hook.stage == DynamicsStage.BEFORE_PRE_UPDATE
         assert hook._active_stages == frozenset(
@@ -1055,14 +1090,14 @@ class TestFixSymmetryHook:
             }
         )
         with pytest.raises(ValueError, match="frequency=1"):
-            FixSymmetryHook(_make_batch(), frequency=2)
+            FixSymmetryHook(records=[], frequency=2)
 
     def test_fused_stage_is_rejected_explicitly(self) -> None:
         """FusedStage construction rejects the missing AFTER_PRE_UPDATE stage."""
         batch = _make_cubic_batch()
         model = _AsymmetricModel()
         constrained = FIRE(
-            model=model, dt=0.01, hooks=[FixSymmetryHook(batch, adjust_cell=False)]
+            model=model, dt=0.01, hooks=[_make_hook(batch, adjust_cell=False)]
         )
         other = FIRE(model=model, dt=0.01)
         with pytest.raises(ValueError, match="FixSymmetryHook"):
@@ -1077,7 +1112,7 @@ class TestFixSymmetryHook:
         batch = _make_cubic_batch()
         model = _AsymmetricModel()
         stages = [(0, FIRE(model=model, dt=0.01))]
-        hook = FixSymmetryHook(batch, adjust_cell=False)
+        hook = _make_hook(batch, adjust_cell=False)
 
         with pytest.raises(ValueError, match="FixSymmetryHook"):
             if registration == "constructor":
@@ -1089,7 +1124,7 @@ class TestFixSymmetryHook:
     def test_missing_after_pre_update_has_runtime_guard(self) -> None:
         """Nonstandard lifecycles cannot silently skip coordinate projection."""
         batch = _make_cubic_batch()
-        hook = FixSymmetryHook(batch)
+        hook = _make_hook(batch)
         ctx = _context(batch)
         hook(ctx, DynamicsStage.BEFORE_PRE_UPDATE)
         with pytest.raises(RuntimeError, match="does not support FusedStage"):
@@ -1113,7 +1148,7 @@ def test_real_optimizer_run_preserves_symmetry(
     from ase.spacegroup.symmetrize import check_symmetry
 
     batch = _make_cubic_batch(device)
-    hook = FixSymmetryHook(batch)
+    hook = _make_hook(batch)
     initial_number = check_symmetry(
         Atoms(
             numbers=batch.atomic_numbers.cpu().numpy(),
@@ -1121,7 +1156,7 @@ def test_real_optimizer_run_preserves_symmetry(
             cell=batch.cell[0].cpu().numpy(),
             pbc=True,
         ),
-        symprec=hook.symprec,
+        symprec=0.01,
         verbose=False,
     ).number
     optimizer = optimizer_type(
@@ -1136,7 +1171,7 @@ def test_real_optimizer_run_preserves_symmetry(
             cell=result.cell[0].cpu().numpy(),
             pbc=True,
         ),
-        symprec=hook.symprec,
+        symprec=0.01,
         verbose=False,
     ).number
     assert optimizer.step_count == 3
@@ -1160,7 +1195,7 @@ def test_projected_force_controls_fmax_convergence(device: str) -> None:
     optimizer = FIRE(
         model=model,
         dt=0.01,
-        hooks=[FixSymmetryHook(batch, adjust_cell=False)],
+        hooks=[_make_hook(batch, adjust_cell=False)],
         convergence_hook=ConvergenceHook.from_fmax(0.1),
     )
 
@@ -1168,3 +1203,70 @@ def test_projected_force_controls_fmax_convergence(device: str) -> None:
     assert raw_force_norm > 0.1
     assert torch.equal(converged, torch.tensor([0], device=batch.device))
     assert torch.allclose(batch.forces, torch.zeros_like(batch.forces), atol=1e-12)
+
+
+def test_fire2_variable_cell_inflight_rebinds_symmetry_records(device: str) -> None:
+    """FIRE2 inflight replacement preserves IDs and variable-size symmetry."""
+    from ase.build import bulk
+
+    prepared: list[AtomicData] = []
+    records: list[SymmetryRecord] = []
+    for symmetry_id, repeat in enumerate(((1, 1, 1), (2, 2, 2), (1, 1, 1))):
+        atoms = bulk("Si", "diamond", a=5.43).repeat(repeat)
+        data = AtomicData.from_atoms(atoms, dtype=torch.float64)
+        refined, record = prepare_symmetry(data, symmetry_id)
+        refined.add_system_property(
+            "structure_id", torch.tensor([[symmetry_id]], dtype=torch.long)
+        )
+        prepared.append(refined)
+        records.append(record)
+
+    class PreparedDataset:
+        """Clone-on-read dataset for the inflight integration test."""
+
+        def __len__(self) -> int:
+            return len(prepared)
+
+        def __getitem__(self, index: int) -> tuple[AtomicData, dict]:
+            return prepared[index].clone(), {}
+
+        def get_metadata(self, index: int) -> tuple[int, int]:
+            return prepared[index].num_nodes, 0
+
+    def initialize(batch: Batch) -> None:
+        assert batch.device.type == device
+        batch["forces"] = torch.zeros_like(batch.positions)
+        batch["velocities"] = torch.zeros_like(batch.positions)
+        batch["energy"] = torch.zeros(
+            batch.num_graphs, 1, dtype=batch.positions.dtype, device=batch.device
+        )
+        batch["stress"] = torch.zeros(
+            batch.num_graphs,
+            3,
+            3,
+            dtype=batch.positions.dtype,
+            device=batch.device,
+        )
+
+    sink = HostMemory(capacity=len(prepared))
+    sampler = SizeAwareSampler(
+        PreparedDataset(), max_atoms=16, max_batch_size=2, max_edges=None
+    )
+    optimizer = FIRE2VariableCell(
+        model=_AsymmetricModel(),
+        dt=0.01,
+        hooks=[FixSymmetryHook(records=records)],
+        convergence_hook=ConvergenceHook.from_fmax(0.1),
+        sampler=sampler,
+        sinks=[sink],
+        init_fn=initialize,
+        refill_frequency=1,
+        max_steps_per_system=3,
+        device_type=device,
+    )
+
+    assert optimizer.run(n_steps=10) is None
+    completed = sink.read()
+    assert sorted(completed.structure_id.view(-1).tolist()) == [0, 1, 2]
+    assert completed.inflight_step_count.view(-1).tolist() == [1, 1, 1]
+    assert completed.inflight_termination.view(-1).tolist() == [1, 1, 1]

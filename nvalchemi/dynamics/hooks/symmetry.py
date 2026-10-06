@@ -18,17 +18,145 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 
 import torch
 
 from nvalchemi import OptionalDependency
-from nvalchemi.data import Batch
+from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.hooks._context import DynamicsContext
 
-__all__ = ["FixSymmetryHook"]
+__all__ = ["FixSymmetryHook", "SymmetryRecord", "prepare_symmetry"]
+
+
+@dataclass(frozen=True, slots=True)
+class SymmetryRecord:
+    """Precomputed space-group operations for one atomic structure.
+
+    The tensors are stored on CPU so records can be prepared before an
+    in-flight dynamics run without occupying GPU memory.  The hook transfers
+    the active records to the batch device when the active layout changes.
+
+    Parameters
+    ----------
+    symmetry_id : int
+        Stable identifier stored on the corresponding :class:`AtomicData`.
+    atomic_numbers : torch.Tensor
+        Atomic numbers in the ordering used by ``symm_map``.
+    rotations : torch.Tensor
+        Fractional-coordinate rotations with shape ``[S, 3, 3]``.
+    translations : torch.Tensor
+        Fractional-coordinate translations with shape ``[S, 3]``.
+    symm_map : torch.Tensor
+        Atom permutations with shape ``[S, N]``.
+    """
+
+    symmetry_id: int
+    atomic_numbers: torch.Tensor
+    rotations: torch.Tensor
+    translations: torch.Tensor
+    symm_map: torch.Tensor
+
+
+@OptionalDependency.ASE.require
+def prepare_symmetry(
+    data: AtomicData,
+    symmetry_id: int,
+    symprec: float = 0.01,
+    verbose: bool = False,
+) -> tuple[AtomicData, SymmetryRecord]:
+    """Refine one periodic structure and precompute its symmetry operations.
+
+    This function performs all ASE/spglib work before dynamics starts.  The
+    returned structure is a clone of *data* carrying a graph-level
+    ``symmetry_id``; the input structure is not modified.
+
+    Parameters
+    ----------
+    data : AtomicData
+        One fully periodic structure with a non-singular cell.
+    symmetry_id : int
+        Stable non-negative identifier for the prepared symmetry record.
+    symprec : float, optional
+        Symmetry tolerance passed to ASE. Default ``0.01``.
+    verbose : bool, optional
+        Forward verbose symmetry information from ASE. Default ``False``.
+
+    Returns
+    -------
+    tuple[AtomicData, SymmetryRecord]
+        Refined structure and its reusable CPU symmetry metadata.
+    """
+    from ase import Atoms
+    from ase.spacegroup.symmetrize import prep_symmetry, refine_symmetry
+
+    if isinstance(symmetry_id, bool) or not isinstance(symmetry_id, int):
+        raise TypeError("symmetry_id must be an integer.")
+    if symmetry_id < 0:
+        raise ValueError("symmetry_id must be non-negative.")
+    if data.cell is None:
+        raise ValueError("prepare_symmetry requires a cell.")
+    if data.pbc is None:
+        raise ValueError("prepare_symmetry requires periodic-boundary flags.")
+    if data.cell.shape not in ((3, 3), (1, 3, 3)):
+        raise ValueError(
+            "prepare_symmetry requires cell shape [3, 3] or [1, 3, 3], "
+            f"got {list(data.cell.shape)}."
+        )
+    if data.pbc.shape not in ((3,), (1, 3)):
+        raise ValueError(
+            "prepare_symmetry requires pbc shape [3] or [1, 3], "
+            f"got {list(data.pbc.shape)}."
+        )
+    cell = data.cell.reshape(3, 3)
+    pbc = data.pbc.reshape(3)
+    if not bool(pbc.all().item()):
+        raise ValueError("prepare_symmetry requires fully periodic boundaries.")
+    if not bool((torch.linalg.det(cell).abs() > 0).item()):
+        raise ValueError("prepare_symmetry requires a non-singular cell.")
+
+    atoms = Atoms(
+        numbers=data.atomic_numbers.detach().cpu().numpy(),
+        positions=data.positions.detach().cpu().numpy(),
+        cell=cell.detach().cpu().numpy(),
+        pbc=pbc.detach().cpu().numpy(),
+    )
+    refine_symmetry(atoms, symprec=symprec, verbose=verbose)
+    rotations, translations, symm_map = prep_symmetry(
+        atoms, symprec=symprec, verbose=verbose
+    )
+
+    refined = data.clone()
+    with torch.no_grad():
+        refined.positions.copy_(
+            torch.as_tensor(
+                atoms.positions,
+                dtype=refined.positions.dtype,
+                device=refined.positions.device,
+            )
+        )
+        refined.cell.copy_(
+            torch.as_tensor(
+                atoms.cell.array,
+                dtype=refined.cell.dtype,
+                device=refined.cell.device,
+            ).reshape_as(refined.cell)
+        )
+    refined.add_system_property(
+        "symmetry_id",
+        torch.tensor([[symmetry_id]], dtype=torch.long, device=refined.device),
+    )
+    record = SymmetryRecord(
+        symmetry_id=symmetry_id,
+        atomic_numbers=refined.atomic_numbers.detach().cpu().clone(),
+        rotations=torch.as_tensor(rotations).detach().cpu().clone(),
+        translations=torch.as_tensor(translations).detach().cpu().clone(),
+        symm_map=torch.as_tensor(symm_map, dtype=torch.long).detach().cpu().clone(),
+    )
+    return refined, record
 
 
 @dataclass(slots=True)
@@ -52,40 +180,34 @@ class _Rank1BatchCache:
 
 @OptionalDependency.ASE.require
 class FixSymmetryHook:
-    """Preserve each graph's initial space-group symmetry during relaxation.
+    """Preserve prepared space-group symmetries during batched relaxation.
 
     This is the batched Torch equivalent of ASE's
-    :class:`ase.constraints.FixSymmetry`. ASE and spglib are used once during
-    construction to refine each initial structure and discover its symmetry
-    operations. All per-step projections then run with Torch on the batch's
-    device.
+    :class:`ase.constraints.FixSymmetry`. Call :func:`prepare_symmetry` once per
+    input structure before dynamics starts.  During dynamics this hook selects
+    the records identified by the active batch's graph-level ``symmetry_id``
+    and performs all projections with Torch on the batch's device.
 
     Parameters
     ----------
-    batch : Batch
-        Initial structures. Every graph must provide a non-singular cell and
-        periodic-boundary flags. Positions and cells are refined in-place.
-    symprec : float, optional
-        Symmetry tolerance passed to ASE. Default ``0.01``.
+    records : Mapping[int, SymmetryRecord] or Iterable[SymmetryRecord]
+        Prepared symmetry metadata keyed by stable symmetry ID.  Iterable
+        records are keyed by their :attr:`SymmetryRecord.symmetry_id` values.
     adjust_positions : bool, optional
         Project position steps and atomic velocities. Default ``True``.
     adjust_cell : bool, optional
         Project cell steps and cell velocities. Default ``True``.
-    verbose : bool, optional
-        Forward verbose symmetry information from ASE. Default ``False``.
     frequency : int, optional
         Constraint frequency. Symmetry constraints must run on every step, so
         only ``1`` is accepted.
 
     Notes
     -----
-    The hook must be constructed from the same graph layout and atomic-number
-    ordering used by the relaxation. It validates that identity on its first
-    successful invocation and raises :class:`ValueError` if the initial batch
-    is replaced, reordered, or resized. The graph layout and atomic-number
-    ordering must remain unchanged afterward. Consequently, this hook is not
-    compatible with in-flight replacement or graph graduation that changes the
-    active batch layout.
+    The active layout may change at complete step boundaries.  At the next
+    ``BEFORE_PRE_UPDATE`` invocation, the hook rebinds records in graph order,
+    validates graph sizes and atomic-number ordering, and invalidates all
+    layout-dependent projector caches. ASE/spglib are never called while the
+    hook is running.
     ``FusedStage`` is not supported because its sub-stage lifecycle omits
     ``AFTER_PRE_UPDATE``, where position and cell steps must be projected.
     The hook also uses Python graph loops and dynamic safety checks and is not
@@ -97,123 +219,40 @@ class FixSymmetryHook:
     supports_fused_stage = False
     _projector_workspace_bytes = 64 * 1024**2
 
-    @staticmethod
-    def _ase_symmetry_data(
-        batch: Batch,
-        symprec: float,
-        verbose: bool,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-        """Refine graphs with ASE and return symmetry tensors."""
-        from ase import Atoms
-        from ase.spacegroup.symmetrize import prep_symmetry, refine_symmetry
-
-        rotations: list[torch.Tensor] = []
-        translations: list[torch.Tensor] = []
-        symm_maps: list[torch.Tensor] = []
-        refined_positions: list[torch.Tensor] = []
-        refined_cells: list[torch.Tensor] = []
-        batch_ptr = batch.batch_ptr[: batch.num_graphs + 1].detach().cpu().tolist()
-
-        with torch.no_grad():
-            for graph_index, (start, end) in enumerate(
-                zip(batch_ptr[:-1], batch_ptr[1:], strict=True)
-            ):
-                atoms = Atoms(
-                    numbers=batch.atomic_numbers[start:end].detach().cpu().numpy(),
-                    positions=batch.positions[start:end].detach().cpu().numpy(),
-                    cell=batch.cell[graph_index].detach().cpu().numpy(),
-                    pbc=batch.pbc[graph_index].detach().cpu().numpy(),
-                )
-                refine_symmetry(atoms, symprec=symprec, verbose=verbose)
-                graph_rotations, graph_translations, graph_symm_map = prep_symmetry(
-                    atoms, symprec=symprec, verbose=verbose
-                )
-
-                refined_positions.append(
-                    torch.as_tensor(
-                        atoms.positions,
-                        dtype=batch.positions.dtype,
-                        device=batch.positions.device,
-                    )
-                )
-                refined_cells.append(
-                    torch.as_tensor(
-                        atoms.cell.array,
-                        dtype=batch.cell.dtype,
-                        device=batch.cell.device,
-                    )
-                )
-                rotations.append(
-                    torch.as_tensor(
-                        graph_rotations,
-                        dtype=batch.positions.dtype,
-                        device=batch.positions.device,
-                    )
-                )
-                translations.append(
-                    torch.as_tensor(
-                        graph_translations,
-                        dtype=batch.positions.dtype,
-                        device=batch.positions.device,
-                    )
-                )
-                symm_maps.append(
-                    torch.as_tensor(
-                        graph_symm_map,
-                        dtype=torch.long,
-                        device=batch.positions.device,
-                    )
-                )
-
-            # Refine atomically: do not partially mutate the input batch when
-            # symmetry discovery fails for any later graph.
-            batch.positions.copy_(torch.cat(refined_positions, dim=0))
-            batch.cell.copy_(torch.stack(refined_cells, dim=0))
-
-        return rotations, translations, symm_maps
-
     def __init__(
         self,
-        batch: Batch,
-        symprec: float = 0.01,
+        records: Mapping[int, SymmetryRecord] | Iterable[SymmetryRecord],
         adjust_positions: bool = True,
         adjust_cell: bool = True,
-        verbose: bool = False,
         frequency: int = 1,
     ) -> None:
         if frequency != 1:
             raise ValueError(
                 "FixSymmetryHook is a constraint and requires frequency=1."
             )
-        if batch.num_graphs == 0:
-            raise ValueError("FixSymmetryHook requires at least one graph.")
-        if getattr(batch, "cell", None) is None:
-            raise ValueError("FixSymmetryHook requires a cell for every graph.")
-        if getattr(batch, "pbc", None) is None:
-            raise ValueError("FixSymmetryHook requires pbc for every graph.")
-        if batch.cell.shape != (batch.num_graphs, 3, 3):
-            raise ValueError(
-                "FixSymmetryHook requires cell shape "
-                f"[{batch.num_graphs}, 3, 3], got {list(batch.cell.shape)}."
-            )
-        if batch.pbc.shape != (batch.num_graphs, 3):
-            raise ValueError(
-                "FixSymmetryHook requires pbc shape "
-                f"[{batch.num_graphs}, 3], got {list(batch.pbc.shape)}."
-            )
-        if not bool(batch.pbc.all().item()):
-            raise ValueError(
-                "FixSymmetryHook requires fully periodic boundary conditions "
-                "for every graph."
-            )
-        if not bool((torch.linalg.det(batch.cell).abs() > 0).all().item()):
-            raise ValueError("FixSymmetryHook requires non-singular cells.")
+        if isinstance(records, Mapping):
+            prepared_records = dict(records)
+            for key, record in prepared_records.items():
+                if key != record.symmetry_id:
+                    raise ValueError(
+                        "FixSymmetryHook record mapping keys must match "
+                        "SymmetryRecord.symmetry_id."
+                    )
+        else:
+            prepared_records = {}
+            for record in records:
+                if record.symmetry_id in prepared_records:
+                    raise ValueError(
+                        f"Duplicate symmetry record ID {record.symmetry_id}."
+                    )
+                prepared_records[record.symmetry_id] = record
+        if not prepared_records:
+            raise ValueError("FixSymmetryHook requires at least one symmetry record.")
 
         self.frequency = frequency
-        self.symprec = symprec
         self.adjust_positions = adjust_positions
         self.adjust_cell = adjust_cell
-        self.verbose = verbose
+        self.records = prepared_records
         self._active_stages = frozenset(
             {
                 DynamicsStage.BEFORE_PRE_UPDATE,
@@ -222,13 +261,11 @@ class FixSymmetryHook:
                 DynamicsStage.AFTER_POST_UPDATE,
             }
         )
-        self.rotations, self.translations, self.symm_maps = self._ase_symmetry_data(
-            batch, symprec, verbose
-        )
-        self._batch_ptr = batch.batch_ptr[: batch.num_graphs + 1].detach().clone()
-        self._batch_ptr_values = tuple(int(value) for value in self._batch_ptr.tolist())
-        self._atomic_numbers = batch.atomic_numbers.detach().clone()
-        self._batch_validated = False
+        self.rotations: list[torch.Tensor] = []
+        self.translations: list[torch.Tensor] = []
+        self.symm_maps: list[torch.Tensor] = []
+        self._batch_ptr_values: tuple[int, ...] = ()
+        self._layout_signature: tuple[object, ...] | None = None
         self._saved_positions: torch.Tensor | None = None
         self._saved_cells: torch.Tensor | None = None
         self._awaiting_after_pre_update = False
@@ -257,30 +294,114 @@ class FixSymmetryHook:
         """Return whether the hook participates in *stage*."""
         return stage in self._active_stages
 
-    def _validate_batch(self, batch: Batch) -> None:
-        """Validate graph boundaries and atomic identity against initialization."""
-        current_ptr = batch.batch_ptr[: batch.num_graphs + 1].detach()
-        expected_ptr = self._batch_ptr.to(
-            device=current_ptr.device, dtype=current_ptr.dtype
-        )
-        self._batch_ptr = expected_ptr
-        if current_ptr.shape != self._batch_ptr.shape or not torch.equal(
-            current_ptr, expected_ptr
-        ):
+    @staticmethod
+    def _current_layout_signature(batch: Batch) -> tuple[object, ...]:
+        """Return a synchronization-free signature for layout mutations."""
+        symmetry_ids = getattr(batch, "symmetry_id", None)
+        if not isinstance(symmetry_ids, torch.Tensor):
             raise ValueError(
-                "FixSymmetryHook batch graph layout differs from its initial batch_ptr."
+                "FixSymmetryHook requires graph-level symmetry_id metadata. "
+                "Prepare inputs with prepare_symmetry()."
             )
-        current_numbers = batch.atomic_numbers.detach()
-        expected_numbers = self._atomic_numbers.to(
-            device=current_numbers.device, dtype=current_numbers.dtype
+        batch_ptr = batch.batch_ptr
+        return (
+            id(batch),
+            batch.num_graphs,
+            batch.num_nodes,
+            symmetry_ids.data_ptr(),
+            symmetry_ids._version,
+            batch.atomic_numbers.data_ptr(),
+            batch.atomic_numbers._version,
+            batch_ptr.data_ptr(),
+            batch_ptr._version,
         )
-        self._atomic_numbers = expected_numbers
-        if current_numbers.shape != self._atomic_numbers.shape or not torch.equal(
-            current_numbers, expected_numbers
-        ):
+
+    def _bind_batch(self, batch: Batch) -> None:
+        """Bind active records in graph order and reset projector caches."""
+        if batch.num_graphs == 0:
+            raise ValueError("FixSymmetryHook requires at least one active graph.")
+        if getattr(batch, "cell", None) is None:
+            raise ValueError("FixSymmetryHook requires a cell for every graph.")
+        if getattr(batch, "pbc", None) is None:
+            raise ValueError("FixSymmetryHook requires pbc for every graph.")
+        if batch.cell.shape != (batch.num_graphs, 3, 3):
             raise ValueError(
-                "FixSymmetryHook batch atomic_numbers differ from the initial ordering."
+                "FixSymmetryHook requires cell shape "
+                f"[{batch.num_graphs}, 3, 3], got {list(batch.cell.shape)}."
             )
+        if batch.pbc.shape != (batch.num_graphs, 3):
+            raise ValueError(
+                "FixSymmetryHook requires pbc shape "
+                f"[{batch.num_graphs}, 3], got {list(batch.pbc.shape)}."
+            )
+        if not bool(batch.pbc.all().item()):
+            raise ValueError(
+                "FixSymmetryHook requires fully periodic boundary conditions "
+                "for every graph."
+            )
+        if not bool((torch.linalg.det(batch.cell).abs() > 0).all().item()):
+            raise ValueError("FixSymmetryHook requires non-singular cells.")
+
+        symmetry_ids = batch.symmetry_id.reshape(-1).detach().cpu().tolist()
+        if len(symmetry_ids) != batch.num_graphs:
+            raise ValueError(
+                "FixSymmetryHook requires one symmetry_id per graph, got "
+                f"{len(symmetry_ids)} for {batch.num_graphs} graphs."
+            )
+        batch_ptr_values = tuple(
+            int(value)
+            for value in batch.batch_ptr[: batch.num_graphs + 1].detach().cpu().tolist()
+        )
+        atomic_numbers = batch.atomic_numbers.detach().cpu()
+        active_records = []
+        for graph_index, (symmetry_id, start, end) in enumerate(
+            zip(
+                symmetry_ids,
+                batch_ptr_values[:-1],
+                batch_ptr_values[1:],
+                strict=True,
+            )
+        ):
+            record = self.records.get(int(symmetry_id))
+            if record is None:
+                raise ValueError(
+                    f"FixSymmetryHook has no record for symmetry_id {symmetry_id} "
+                    f"at graph {graph_index}."
+                )
+            expected = record.atomic_numbers.reshape(-1).to(dtype=torch.long)
+            actual = atomic_numbers[start:end].to(dtype=torch.long)
+            if expected.shape != actual.shape or not torch.equal(expected, actual):
+                raise ValueError(
+                    "FixSymmetryHook atomic_numbers do not match record "
+                    f"{symmetry_id} at graph {graph_index}."
+                )
+            if record.symm_map.shape != (record.rotations.shape[0], end - start):
+                raise ValueError(
+                    "FixSymmetryHook symmetry map shape does not match the active "
+                    f"graph for record {symmetry_id}."
+                )
+            active_records.append(record)
+
+        self.rotations = [
+            record.rotations.to(
+                device=batch.positions.device, dtype=batch.positions.dtype
+            )
+            for record in active_records
+        ]
+        self.translations = [
+            record.translations.to(
+                device=batch.positions.device, dtype=batch.positions.dtype
+            )
+            for record in active_records
+        ]
+        self.symm_maps = [
+            record.symm_map.to(device=batch.positions.device, dtype=torch.long)
+            for record in active_records
+        ]
+        self._batch_ptr_values = batch_ptr_values
+        self._rank1_batch_cache = None
+        self._rank2_rotation_cache.clear()
+        self._rank2_batch_cache = None
 
     def _graph_symmetry(
         self, graph_index: int, reference: torch.Tensor
@@ -751,15 +872,30 @@ class FixSymmetryHook:
         if ctx.batch is None:
             raise ValueError("FixSymmetryHook requires a dynamics batch.")
         batch = ctx.batch
-        needs_validation = not self._batch_validated
-        if needs_validation:
-            self._validate_batch(batch)
 
         if stage == DynamicsStage.BEFORE_PRE_UPDATE:
+            signature = self._current_layout_signature(batch)
+            if signature != self._layout_signature:
+                self._bind_batch(batch)
+                # Binding only reads batch tensors, so the pre-bind signature
+                # remains valid for detecting replacement before the next step.
+                self._layout_signature = signature
             self._awaiting_after_pre_update = True
             self._saved_positions = batch.positions.clone()
             self._saved_cells = batch.cell.clone()
-        elif stage == DynamicsStage.AFTER_PRE_UPDATE:
+            return
+
+        if self._layout_signature is None:
+            raise RuntimeError(
+                "FixSymmetryHook must run at BEFORE_PRE_UPDATE before other stages."
+            )
+        if self._current_layout_signature(batch) != self._layout_signature:
+            raise RuntimeError(
+                "FixSymmetryHook batch layout changed during an optimization step. "
+                "Replace or reorder graphs only at a complete step boundary."
+            )
+
+        if stage == DynamicsStage.AFTER_PRE_UPDATE:
             self._project_position_and_cell_steps(batch)
             self._project_velocities(ctx)
             self._awaiting_after_pre_update = False
@@ -778,6 +914,3 @@ class FixSymmetryHook:
                 self._project_rank2(stress, batch.cell)
         elif stage == DynamicsStage.AFTER_POST_UPDATE:
             self._project_velocities(ctx)
-
-        if needs_validation:
-            self._batch_validated = True
