@@ -33,3 +33,7 @@ scheduler values.
 **08 — Batched Symmetry Relaxation**: TensorNet-powered FIRE2 variable-cell
 relaxation of diamond Si, BCC Fe, and FCC Al with per-graph space-group
 constraints and a lightweight batch-throughput scaling check.
+
+**09 — Inflight Symmetry Relaxation**: TensorNet/FIRE2 variable-cell campaigns
+with mixed atom counts and space groups, dynamic slot replacement, symmetry
+validation, and fixed-batch versus inflight throughput reporting.
