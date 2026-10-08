@@ -70,9 +70,14 @@ tensor references after model evaluations and uses unchanged potential weights.
 `neighbors.py` is the historical current-cell rebuilding hook, local to this
 benchmark rather than a package modification.
 
-## H200 execution
+## CUDA GPU execution
 
-On an allocated H200, use a new result directory for each invocation:
+Historical results were measured on H200. The runner accepts any CUDA GPU;
+A100 execution has not yet been validated. Capacity may need to be reduced
+to fit GPU memory. CUDA-compatible Torch, toolkit-ops, Warp and MatGL builds
+are required. The ASPIRE2B PBS template is site-specific.
+
+On an allocated CUDA GPU, use a new result directory for each invocation:
 
 ```bash
 python run.py --kind smoke --output-dir /YOUR/WRITABLE/PATH/smoke
@@ -117,9 +122,10 @@ unchanged copy of the original cross-method driver. Differences are explicit:
    its worker; no per-candidate recovery or mid-queue acceleration checkpoint exists.
 
 The preserved historical results were measured before extraction. They are
-references, not new measurements from this branch. No new GPU campaign was run
-when preparing the branch. Float32 adaptive trajectories may vary even on the
-same hardware; the A256 crash is an observed case, not a guaranteed replay point.
+references and are retained separately from the subsequent GPU validation.
+New capacity256 measurements are recorded in reference_results/c256_replays.json.
+The historical crash did not recur, but severe near-overlap persists; an exact
+failure step is not a guaranteed replay point.
 
 Wall time includes setup, admission priming, refill, synchronization, tail and
 result collection; model load and warmup are excluded. Telemetry records active
@@ -131,3 +137,11 @@ from convergence; campaign PASS does not mean every structure converged.
 
 See [historical results](reference_results/REPORT.md), `PROVENANCE.json` and
 [Draft PR material](PR_DESCRIPTION.md) for the measured outcomes and limitations.
+
+## Latest GPU check
+
+The packaged capacity256 campaign completed on H200 in462.90s, with987/1280
+converged. An original-configuration replay also completed, in475.93s with984
+converged. Candidate229 remained unconverged and almost coincident in both runs.
+See `reference_results/REPORT.md` and `c256_replays.json` for the distinction
+between queue completion and unresolved physical near-overlap. A100 is untested.

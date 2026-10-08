@@ -1,30 +1,31 @@
-# Draft: H200 conventional inflight benchmark and collapse reproduction
+# Draft: H200 conventional inflight benchmark and near-overlap investigation
 
-The conventional PR2 optimizer and inflight runtime completed1280-start queues
-at capacities64/128, but a256-slot campaign aborted after a62-atom candidate
-collapsed to coincident atoms and the model returned non-finite outputs.
-This branch supplies a standalone conventional-only reproduction setup and
-historical results for discussion of production batching and failure handling.
+A historical 1280-start conventional capacity256 campaign crashed after a
+62-atom candidate (g22/trial9, candidate229) reached coincident atoms and
+non-finite model outputs. Two subsequent capacity256 runs completed, but the
+same candidate still exhausted500 updates without convergence and ended with
+minimum distances of0.000144 and0.0000069 Angstrom. Execution completion does
+not resolve the underlying near-overlap trajectory.
 
-Base: Takuya's `feat/inflight-symmetry-relaxation`, pinned to `e479d16`.
-The optimizer, scheduler, symmetry hook and numerical kernels are unchanged.
-Additions are Cartesian inputs, the measured admission/neighbor/model settings,
-ASE FrechetCellFilter stopping, CUDA workload telemetry, PBS template and reports.
-The public fork's current CI workflow is retained for publishing compatibility;
-this infrastructure alignment is separate from the numerical implementation.
+This branch supplies the conventional benchmark,1280 packaged inputs,
+production stopping configuration, CUDA telemetry, PBS template and historical
+failure snapshot. It is based on `feat/inflight-symmetry-relaxation` at
+`e479d16`; optimizer, scheduler, symmetry hook and numerical kernels are unchanged.
+The public fork's CI workflow is retained for publishing compatibility.
 
-Stop: max ASE filter atomic/cell generalized-force row norm <0.02,500 updates
-per candidate per stage, one observation, no separate stress2e-5 threshold.
-The archived A64/A128 times are503.74s/463.67s, with985/1280 converged each.
-A256 timing is incomplete and must not be treated as full-queue throughput.
+Stop: max ASE FrechetCellFilter atomic/cell generalized-force row norm <0.02,
+500 updates per candidate; no separate stress2e-5 condition.
 
-The standalone extraction changes initial-coordinate export and warmup:
-CPU float32 Cartesian starts replace runtime chart expansion, warmup is
-conventional-only, and four-stage transitions omit the chart audit.
-Historical measurements are retained separately. Exact trajectory/failure
-reproduction and new GPU timing are not yet verified.
+The packaged capacity256 run completed in462.90s (987/1280 converged).
+An original-configuration replay completed in475.93s (984/1280 converged).
+They are distinct from historical measurements: the packaged driver uses an
+exported Cartesian fixture and standalone warmup; the original-configuration
+replay restores the original fixture reconstruction and warmup sequence.
+Small numerical differences may explain exact-zero overlap and a crash versus
+near-zero overlap and survival; this is a hypothesis, not an established cause.
 
-Review focus: admission correctness, common stopping configuration, workload
-accounting, and how to isolate non-finite candidates without losing unrelated
-work. Validation results are recorded in VALIDATION.json. This is a Draft PR
-for reproduction/review, not a completed production-safety fix.
+Review focus: overlap trajectories, first non-finite values, production stopping
+and how to isolate bad candidates while preserving unrelated work.
+GPU smoke checks passed; CPU regressions87 passed,33 CUDA cases skipped on the
+login node. See VALIDATION.json and reference_results/REPORT.md.
+This is a Draft for reproduction/review, not a completed failure-handling fix.

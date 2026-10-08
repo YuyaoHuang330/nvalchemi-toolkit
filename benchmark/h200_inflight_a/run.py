@@ -104,7 +104,8 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(2)
     torch.manual_seed(20261008)
-    assert "H200" in torch.cuda.get_device_name()
+    if not torch.cuda.is_available():
+        raise RuntimeError("This benchmark requires a CUDA-capable GPU.")
     args.output_dir.mkdir(parents=True, exist_ok=False)
     label = f"{args.kind}_A_c{args.capacity}"
     output = args.output_dir / f"{label}.json"
