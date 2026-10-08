@@ -1,0 +1,36 @@
+{
+  "status": "PASS (CPU/local preparation only)",
+  "regression": {
+    "passed": 87,
+    "skipped": 33,
+    "skip_reason": "CUDA unavailable on login node",
+    "tests": [
+      "test/dynamics/test_inflight.py",
+      "test/dynamics/test_symmetry_hook.py"
+    ]
+  },
+  "Cartesian_fixture": {
+    "starts": 1280,
+    "CPU_roundtrip": "bitwise PASS",
+    "manifest_ID_order": "PASS",
+    "symmetry_binding": "PASS"
+  },
+  "ASE_stopping_parity": {
+    "cases": 24,
+    "threshold_crossings": 48,
+    "status": "PASS"
+  },
+  "real_optimizer_admission_refill": {
+    "device": "cpu",
+    "capacity": 2,
+    "candidates": 5,
+    "fixed_cell": "PASS",
+    "variable_cell": "PASS"
+  },
+  "Python_syntax": "PASS",
+  "PBS_syntax": "PASS",
+  "nvalchemi_library_changes_vs_PR2": 0,
+  "CI_matches_origin_main": true,
+  "new_GPU_runs": 0,
+  "limitation": "Standalone GPU timing and exact historical failure trajectory have not been revalidated."
+}
